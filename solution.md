@@ -261,3 +261,319 @@ SELECT * FROM all_metrics;
      - Увеличенное количество попыток на задачу (сейчас в среднем 3 попытки)
      - Доступ к подсказкам (хотя они менее популярны, могут быть полезны)
    - **Ограничения для бесплатной версии**: Можно ограничить количество попыток на задачу (например, 2-3 попытки бесплатно, далее требуется подписка).
+
+
+
+## Дополнительное задание: Дополнительные метрики
+
+### Метрика 1: Сегментация пользователей по уровню активности и их ценность (LTV)
+
+Мне кажется, что для принятия решения о подписке важно понять, какие пользователи наиболее ценны для платформы и готовы платить. Для этого я предлагаю посчитать сегментацию пользователей по уровню активности и их пожизненную ценность (LTV), потому что:
+
+- Это поможет определить целевую аудиторию для подписки - какие пользователи уже активно используют платформу и могут быть готовы платить
+- Покажет разницу в поведении между "power users" и "casual users", что важно для формирования тарифов
+- Поможет оценить потенциальный доход от разных сегментов пользователей
+
+Код для расчета:
+
+```sql
+WITH user_days_active AS (
+    -- Считаем дни активности отдельно
+    SELECT 
+        user_id,
+        COUNT(DISTINCT entry_at::date) AS days_active
+    FROM userentry
+    GROUP BY user_id
+),
+user_tasks_stats AS (
+    -- Считаем статистику по задачам отдельно
+    SELECT 
+        user_id,
+        COUNT(DISTINCT problem_id) AS tasks_solved,
+        COUNT(id) AS total_task_attempts
+    FROM codesubmit
+    GROUP BY user_id
+),
+user_tests_stats AS (
+    -- Считаем статистику по тестам отдельно
+    SELECT 
+        user_id,
+        COUNT(DISTINCT test_id) AS tests_taken,
+        COUNT(id) AS total_test_attempts
+    FROM teststart
+    GROUP BY user_id
+),
+user_spending AS (
+    -- Считаем траты отдельно
+    SELECT 
+        user_id,
+        SUM(value) AS total_spent
+    FROM transaction
+    WHERE type_id IN (1, 23, 24, 25, 26, 27, 28, 30)
+    GROUP BY user_id
+),
+user_activity_stats AS (
+    -- Объединяем все метрики
+    SELECT 
+        u.id AS user_id,
+        u.date_joined,
+        COALESCE(uda.days_active, 0) AS days_active,
+        COALESCE(uts.tasks_solved, 0) AS tasks_solved,
+        COALESCE(utest.tests_taken, 0) AS tests_taken,
+        COALESCE(usp.total_spent, 0) AS total_spent
+    FROM users u
+    LEFT JOIN user_days_active uda ON u.id = uda.user_id
+    LEFT JOIN user_tasks_stats uts ON u.id = uts.user_id
+    LEFT JOIN user_tests_stats utest ON u.id = utest.user_id
+    LEFT JOIN user_spending usp ON u.id = usp.user_id
+),
+user_segments AS (
+    -- Сегментируем пользователей по активности
+    SELECT 
+        user_id,
+        date_joined,
+        days_active,
+        tasks_solved,
+        tests_taken,
+        total_spent,
+        CASE 
+            WHEN tasks_solved >= 20 OR tests_taken >= 5 OR days_active >= 30 THEN 'Power User'
+            WHEN tasks_solved >= 5 OR tests_taken >= 2 OR days_active >= 7 THEN 'Active User'
+            WHEN tasks_solved > 0 OR tests_taken > 0 THEN 'Casual User'
+            ELSE 'Inactive User'
+        END AS user_segment
+    FROM user_activity_stats
+)
+SELECT 
+    user_segment,
+    COUNT(*) AS user_count,
+    ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM user_segments), 2) AS pct_of_total,
+    ROUND(AVG(days_active), 2) AS avg_days_active,
+    ROUND(AVG(tasks_solved), 2) AS avg_tasks_solved,
+    ROUND(AVG(tests_taken), 2) AS avg_tests_taken,
+    ROUND(AVG(total_spent), 2) AS avg_spent,
+    ROUND(SUM(total_spent), 2) AS total_spent_by_segment,
+    ROUND(100.0 * COUNT(CASE WHEN total_spent > 0 THEN 1 END) / COUNT(*), 2) AS pct_paying_users
+FROM user_segments
+GROUP BY user_segment
+ORDER BY 
+    CASE user_segment
+        WHEN 'Power User' THEN 1
+        WHEN 'Active User' THEN 2
+        WHEN 'Casual User' THEN 3
+        WHEN 'Inactive User' THEN 4
+    END;
+```
+
+**Выводы:**
+
+Анализ сегментации пользователей показывает четкое разделение на группы:
+
+1. **Power Users (5.91% пользователей)** - наиболее ценная группа:
+   - В среднем активны 16 дней, решают 35 задач, проходят 3 теста
+   - Средние траты: 229.66 кодкоинов на пользователя
+   - 67% из них платят за контент
+   - Генерируют 52% всех трат (37,665 из 75,170 кодкоинов)
+   - **Рекомендация**: Это основная целевая аудитория для премиум-подписки. Готовы платить за качественный контент.
+
+2. **Active Users (17.63% пользователей)** - стабильная группа:
+   - В среднем активны 4 дня, решают 4 задачи, проходят 2 теста
+   - Средние траты: 42.57 кодкоинов
+   - 69% платят (самый высокий процент конверсии!)
+   - **Рекомендация**: Хорошая целевая аудитория для месячной подписки. Высокая готовность платить.
+
+3. **Casual Users (38.86% пользователей)** - самая большая группа:
+   - В среднем активны 1.5 дня, решают менее 1 задачи
+   - Средние траты: 13.61 кодкоинов
+   - Только 44% платят
+   - **Рекомендация**: Нужны стимулы для конверсии. Возможно, бесплатный пробный период подписки.
+
+4. **Inactive Users (37.60% пользователей)** - неактивная группа:
+   - Почти не используют платформу
+   - Только 7% платят
+   - **Рекомендация**: Фокус на удержание и онбординг, а не на монетизацию.
+
+**Итог**: 23.54% пользователей (Power + Active) генерируют основную часть дохода и являются основной целевой аудиторией для подписки.
+
+### Метрика 2: Время до первой покупки и конверсия в платящих пользователей
+
+Мне кажется, что важно понять, как быстро пользователи начинают тратить деньги после регистрации и какой процент пользователей вообще когда-либо платил. Для этого я предлагаю посчитать время до первой покупки и конверсию в платящих, потому что:
+
+- Это покажет оптимальный момент для предложения подписки - когда пользователь уже готов платить
+- Поможет понять, нужно ли стимулировать первых покупок для увеличения конверсии
+- Покажет разницу между пользователями, которые платят сразу, и теми, кто долго "присматривается"
+
+Код для расчета:
+
+```sql
+WITH user_registration AS (
+    SELECT 
+        id AS user_id,
+        date_joined
+    FROM users
+),
+first_purchase AS (
+    SELECT 
+        t.user_id,
+        MIN(t.created_at) AS first_purchase_date
+    FROM transaction t
+    WHERE t.user_id IS NOT NULL 
+      AND t.type_id IN (1, 23, 24, 25, 26, 27, 28, 30)  -- только списания
+    GROUP BY t.user_id
+),
+users_with_purchase_info AS (
+    SELECT 
+        ur.user_id,
+        ur.date_joined,
+        fp.first_purchase_date,
+        CASE 
+            WHEN fp.first_purchase_date IS NOT NULL THEN 
+                EXTRACT(EPOCH FROM (fp.first_purchase_date - ur.date_joined)) / 86400.0
+            ELSE NULL
+        END AS days_to_first_purchase
+    FROM user_registration ur
+    LEFT JOIN first_purchase fp ON ur.user_id = fp.user_id
+),
+sorted_purchases AS (
+    SELECT 
+        days_to_first_purchase,
+        ROW_NUMBER() OVER (ORDER BY days_to_first_purchase) AS rn,
+        COUNT(*) OVER () AS cnt
+    FROM users_with_purchase_info
+    WHERE days_to_first_purchase IS NOT NULL
+)
+SELECT 
+    (SELECT COUNT(*) FROM users_with_purchase_info) AS total_users,
+    (SELECT COUNT(*) FROM users_with_purchase_info WHERE first_purchase_date IS NOT NULL) AS users_who_paid,
+    ROUND(100.0 * (SELECT COUNT(*) FROM users_with_purchase_info WHERE first_purchase_date IS NOT NULL) / 
+          (SELECT COUNT(*) FROM users_with_purchase_info), 2) AS conversion_to_paying_pct,
+    (SELECT ROUND(AVG(days_to_first_purchase)::numeric, 2) FROM users_with_purchase_info WHERE days_to_first_purchase IS NOT NULL) AS avg_days_to_first_purchase,
+    (SELECT ROUND(AVG(days_to_first_purchase)::numeric, 2) 
+     FROM sorted_purchases 
+     WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)) AS median_days_to_first_purchase,
+    (SELECT ROUND(MIN(days_to_first_purchase)::numeric, 2) FROM users_with_purchase_info WHERE days_to_first_purchase IS NOT NULL) AS min_days_to_first_purchase,
+    (SELECT ROUND(MAX(days_to_first_purchase)::numeric, 2) FROM users_with_purchase_info WHERE days_to_first_purchase IS NOT NULL) AS max_days_to_first_purchase,
+    (SELECT COUNT(*) FROM users_with_purchase_info WHERE days_to_first_purchase <= 1) AS paid_within_1_day,
+    (SELECT COUNT(*) FROM users_with_purchase_info WHERE days_to_first_purchase <= 7) AS paid_within_7_days,
+    (SELECT COUNT(*) FROM users_with_purchase_info WHERE days_to_first_purchase <= 30) AS paid_within_30_days;
+```
+
+**Выводы:**
+
+Анализ конверсии в платящих пользователей показывает важные паттерны:
+
+1. **Общая конверсия**: 41.10% пользователей когда-либо платили за контент - это хороший показатель готовности платить.
+
+2. **Скорость конверсии**:
+   - **977 пользователей (86% платящих)** платят в первый же день после регистрации!
+   - **1049 пользователей (92%)** платят в течение первой недели
+   - **1094 пользователей (96%)** платят в течение первого месяца
+   - Медианное время до первой покупки: **0 дней** (большинство платят сразу)
+
+3. **Выводы**:
+   - Пользователи готовы платить сразу после регистрации - это говорит о высоком доверии к платформе
+   - Предложение подписки нужно делать **сразу при регистрации** или в первые дни использования
+   - Бесплатный пробный период может быть не так эффективен, как скидка на первую подписку
+   - **Рекомендация**: Предлагать подписку в онбординге, сразу после регистрации, с привлекательным предложением для новых пользователей
+
+4. **Среднее время до покупки**: 3.75 дня, но это искажено небольшим количеством пользователей, которые платят позже. Большинство платят сразу.
+
+### Метрика 3: Частота использования платформы (DAU/MAU ratio и паттерны активности)
+
+Мне кажется, что важно понять, как часто пользователи возвращаются на платформу и какие у них паттерны активности. Для этого я предлагаю посчитать соотношение DAU/MAU и частоту использования, потому что:
+
+- Это покажет, насколько "липким" является продукт - возвращаются ли пользователи регулярно
+- Поможет определить оптимальные сроки подписки - если пользователи заходят каждый день, им подойдет месячная подписка, если раз в неделю - возможно, лучше годовая
+- Покажет, есть ли сезонность или другие паттерны в использовании
+
+Код для расчета:
+
+```sql
+WITH monthly_active_users AS (
+    -- Пользователи, активные в каждом месяце
+    SELECT 
+        DATE_TRUNC('month', ue.entry_at) AS activity_month,
+        COUNT(DISTINCT ue.user_id) AS mau
+    FROM userentry ue
+    GROUP BY DATE_TRUNC('month', ue.entry_at)
+),
+daily_active_users AS (
+    -- Пользователи, активные в каждый день
+    SELECT 
+        DATE_TRUNC('month', ue.entry_at) AS activity_month,
+        ue.entry_at::date AS activity_date,
+        COUNT(DISTINCT ue.user_id) AS dau
+    FROM userentry ue
+    GROUP BY DATE_TRUNC('month', ue.entry_at), ue.entry_at::date
+),
+dau_mau_ratio AS (
+    -- Соотношение DAU/MAU по месяцам
+    SELECT 
+        mau.activity_month,
+        mau.mau,
+        ROUND(AVG(dau.dau), 2) AS avg_dau,
+        ROUND(100.0 * AVG(dau.dau) / mau.mau, 2) AS dau_mau_ratio_pct
+    FROM monthly_active_users mau
+    LEFT JOIN daily_active_users dau ON mau.activity_month = dau.activity_month
+    GROUP BY mau.activity_month, mau.mau
+),
+user_frequency AS (
+    -- Частота использования для каждого пользователя
+    SELECT 
+        ue.user_id,
+        COUNT(DISTINCT ue.entry_at::date) AS total_active_days,
+        MIN(ue.entry_at::date) AS first_activity,
+        MAX(ue.entry_at::date) AS last_activity,
+        (MAX(ue.entry_at::date) - MIN(ue.entry_at::date) + 1) AS days_between_first_last,
+        CASE 
+            WHEN (MAX(ue.entry_at::date) - MIN(ue.entry_at::date) + 1) > 0 
+            THEN COUNT(DISTINCT ue.entry_at::date)::numeric / (MAX(ue.entry_at::date) - MIN(ue.entry_at::date) + 1)
+            ELSE 0
+        END AS activity_frequency
+    FROM userentry ue
+    GROUP BY ue.user_id
+)
+SELECT 
+    'DAU/MAU Ratio by Month' AS metric_type,
+    TO_CHAR(activity_month, 'YYYY-MM') AS period,
+    mau,
+    avg_dau,
+    dau_mau_ratio_pct
+FROM dau_mau_ratio
+UNION ALL
+SELECT 
+    'User Activity Frequency' AS metric_type,
+    'Overall' AS period,
+    NULL AS mau,
+    ROUND(AVG(total_active_days), 2) AS avg_dau,
+    ROUND(AVG(activity_frequency) * 100, 2) AS dau_mau_ratio_pct
+FROM user_frequency
+WHERE days_between_first_last > 0
+ORDER BY metric_type, period;
+```
+
+**Выводы:**
+
+Анализ частоты использования показывает "липкость" продукта:
+
+1. **DAU/MAU Ratio**: 
+   - В среднем составляет 6-12% в зависимости от месяца
+   - Это означает, что из всех пользователей, активных в месяце, только 6-12% активны каждый день
+   - Для образовательной платформы это нормальный показатель (пользователи не заходят каждый день)
+
+2. **Паттерны по месяцам**:
+   - Наиболее активные месяцы: ноябрь-декабрь 2021, февраль-май 2022
+   - DAU/MAU ratio растет со временем (с 6.4% в феврале до 11.7% в мае), что говорит об улучшении удержания
+
+3. **Частота активности пользователей**:
+   - Средняя частота активности: **77.26%** - это очень высокий показатель!
+   - Это означает, что активные пользователи используют платформу в 77% дней между первым и последним визитом
+   - Среднее количество активных дней: 2.90
+
+4. **Выводы для подписки**:
+   - Пользователи не заходят каждый день, но когда заходят - используют платформу интенсивно
+   - **Месячная подписка** оптимальна, так как покрывает период активного использования
+   - **Годовая подписка** с большой скидкой привлекательна для тех, кто планирует заниматься долгосрочно
+   - Недельная подписка может быть слишком короткой для большинства пользователей
+
+**Рекомендация**: Основной фокус на месячную подписку, годовая - как опция со скидкой для долгосрочных пользователей.
